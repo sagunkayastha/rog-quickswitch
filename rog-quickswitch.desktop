@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ROG Quickswitch
+GenericName=GPU & Power Profile Switcher
+Comment=Switch GPU mode, performance profile, charge limit and panel overdrive on ROG laptops
+Exec=/home/sgkayast/src/rog-quickswitch/target/release/rog-quickswitch
+Icon=gpu-compute
+Terminal=false
+Categories=System;
+StartupNotify=true
+Keywords=gpu;power;profile;rog;asus;supergfxctl;asusctl;hybrid;integrated;

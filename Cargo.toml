@@ -1,0 +1,21 @@
+[package]
+name = "rog-quickswitch"
+version = "0.1.0"
+edition = "2024"
+description = "Small GUI for asus-linux: GPU mode, performance profile, charge limit, fan curves, panel overdrive, Aura"
+license = "MIT"
+
+[dependencies]
+gtk4 = { version = "0.9", features = ["v4_12"] }
+libadwaita = { version = "0.7", features = ["v1_5"] }
+glib = "0.20"
+zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+futures-util = "0.3"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
