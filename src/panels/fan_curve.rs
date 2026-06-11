@@ -1,10 +1,11 @@
-// Fan curves: G-Helper-style combined editor with draggable chart points.
+// Fan curves: G-Helper-style chart editor.
 //   - Profile selector (Quiet / Balanced / Performance) at top
 //   - Single chart showing CPU (yellow) and GPU (cyan) curves overlaid
-//   - Drag any point on the chart to edit; matching spinboxes update live
-//   - Per-fan compact rows of 8 temp + 8 duty% spinboxes
-//   - One Apply button writes both curves
-//   - "Reset to firmware defaults" resets the whole profile
+//   - Drag any point on the chart to edit; the node shows its % value
+//   - Apply writes both curves; Reset restores firmware defaults
+//
+// No spinbox grid / per-fan switches — the chart is the only control, the way
+// G-Helper does it. Apply enables the curves for the profile.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -17,16 +18,16 @@ use crate::panels::{self, ProfileBus};
 use crate::sysfs::platform_profile;
 
 const CHART_W: i32 = 400;
-const CHART_H: i32 = 150;
+const CHART_H: i32 = 190;
 const PAD_LEFT: f64 = 26.0;
 const PAD_BOTTOM: f64 = 16.0;
-const PAD_TOP: f64 = 6.0;
+const PAD_TOP: f64 = 14.0;
 const PAD_RIGHT: f64 = 6.0;
 const TEMP_MIN: f64 = 30.0;
 const TEMP_MAX: f64 = 100.0;
 const DUTY_MAX: f64 = 100.0;
 const DRAG_HIT_RADIUS: f64 = 18.0;
-const POINT_RADIUS: f64 = 4.0;
+const POINT_RADIUS: f64 = 4.5;
 
 const CPU_RGB: (f64, f64, f64) = (1.0, 0.757, 0.027); // #ffc107
 const GPU_RGB: (f64, f64, f64) = (0.306, 0.773, 1.0); // #4ec5ff
@@ -144,9 +145,6 @@ struct FanState {
     name: String,
     temps: Rc<RefCell<[u8; 8]>>,
     duty: Rc<RefCell<[u8; 8]>>,
-    enable: gtk::Switch,
-    temp_spins: Vec<gtk::SpinButton>,
-    duty_spins: Vec<gtk::SpinButton>,
 }
 
 fn build_editor(profile: Profile, curves: Vec<FanCurve>, parent: gtk::Box) -> gtk::Box {
@@ -155,38 +153,13 @@ fn build_editor(profile: Profile, curves: Vec<FanCurve>, parent: gtk::Box) -> gt
         .spacing(6)
         .build();
 
-    // Build fan states (state cells + spinbuttons) up front so the chart's
-    // gesture handler can drive both.
+    // Build fan states (state cells only — the chart is the sole editor).
     let mut states: Vec<FanState> = Vec::with_capacity(curves.len());
     for curve in &curves {
-        let temps = Rc::new(RefCell::new(curve.temp_points()));
-        let duty = Rc::new(RefCell::new(curve.duty_points()));
-        let enable = gtk::Switch::builder()
-            .active(curve.enabled)
-            .valign(gtk::Align::Center)
-            .build();
-
-        let mut temp_spins = Vec::with_capacity(8);
-        let mut duty_spins = Vec::with_capacity(8);
-        for i in 0..8 {
-            let t = gtk::SpinButton::with_range(0.0, 110.0, 1.0);
-            t.set_value(temps.borrow()[i] as f64);
-            t.set_width_chars(3);
-            temp_spins.push(t);
-
-            let d = gtk::SpinButton::with_range(0.0, 100.0, 1.0);
-            d.set_value(duty.borrow()[i] as f64);
-            d.set_width_chars(3);
-            duty_spins.push(d);
-        }
-
         states.push(FanState {
             name: curve.name.clone(),
-            temps,
-            duty,
-            enable,
-            temp_spins,
-            duty_spins,
+            temps: Rc::new(RefCell::new(curve.temp_points())),
+            duty: Rc::new(RefCell::new(curve.duty_points())),
         });
     }
 
@@ -202,29 +175,7 @@ fn build_editor(profile: Profile, curves: Vec<FanCurve>, parent: gtk::Box) -> gt
         });
     }
 
-    // Wire spinbutton value_changed -> state + chart redraw.
-    for state in &states {
-        for i in 0..8 {
-            {
-                let temps = state.temps.clone();
-                let chart = chart.clone();
-                state.temp_spins[i].connect_value_changed(move |s| {
-                    temps.borrow_mut()[i] = s.value().clamp(0.0, 255.0).round() as u8;
-                    chart.queue_draw();
-                });
-            }
-            {
-                let duty = state.duty.clone();
-                let chart = chart.clone();
-                state.duty_spins[i].connect_value_changed(move |s| {
-                    duty.borrow_mut()[i] = s.value().clamp(0.0, 100.0).round() as u8;
-                    chart.queue_draw();
-                });
-            }
-        }
-    }
-
-    // GestureDrag on the chart for point-dragging.
+    // GestureDrag on the chart for point-dragging — writes state directly.
     let states_rc: Rc<Vec<FanState>> = Rc::new(states.clone());
     let drag_target: Rc<Cell<Option<(usize, usize)>>> = Rc::new(Cell::new(None));
     let drag_start: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
@@ -250,14 +201,40 @@ fn build_editor(profile: Profile, curves: Vec<FanCurve>, parent: gtk::Box) -> gt
         gesture.connect_drag_update(move |_, dx, dy| {
             if let Some((fan_idx, point_idx)) = drag_target.get() {
                 let (sx, sy) = drag_start.get();
-                let x = sx + dx;
-                let y = sy + dy;
                 let w = chart.width() as f64;
                 let h = chart.height() as f64;
-                let (temp, duty) = screen_to_data(x, y, w, h);
+                let (temp, duty) = screen_to_data(sx + dx, sy + dy, w, h);
                 let s = &states[fan_idx];
-                s.temp_spins[point_idx].set_value(temp.clamp(0.0, 110.0).round());
-                s.duty_spins[point_idx].set_value(duty.clamp(0.0, 100.0).round());
+
+                let mut temps = s.temps.borrow_mut();
+                let mut duties = s.duty.borrow_mut();
+
+                // Keep points from crossing horizontally: clamp this point's
+                // temperature between its neighbours.
+                let lo_t = if point_idx > 0 { temps[point_idx - 1] } else { 0 };
+                let hi_t = if point_idx < 7 { temps[point_idx + 1] } else { 110 };
+                let nt = (temp.clamp(0.0, 110.0).round() as u8).max(lo_t).min(hi_t);
+                let nd = duty.clamp(0.0, 100.0).round() as u8;
+                temps[point_idx] = nt;
+                duties[point_idx] = nd;
+
+                // Duty must be non-decreasing with temperature. Pushing a point
+                // up drags every higher-temp point up to at least this value;
+                // pulling it down drags every lower-temp point down to it.
+                for j in (point_idx + 1)..8 {
+                    if duties[j] < nd {
+                        duties[j] = nd;
+                    }
+                }
+                for j in 0..point_idx {
+                    if duties[j] > nd {
+                        duties[j] = nd;
+                    }
+                }
+
+                drop(temps);
+                drop(duties);
+                chart.queue_draw();
             }
         });
     }
@@ -296,11 +273,6 @@ fn build_editor(profile: Profile, curves: Vec<FanCurve>, parent: gtk::Box) -> gt
     }
     outer.append(&legend);
 
-    // Per-fan T/% spinbox rows.
-    for state in &states {
-        outer.append(&build_fan_rows(state));
-    }
-
     // Bottom action row.
     let actions = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -332,7 +304,6 @@ fn build_editor(profile: Profile, curves: Vec<FanCurve>, parent: gtk::Box) -> gt
                 ) {
                     eprintln!("enable after apply: {e}");
                 }
-                s.enable.set_active(true);
             }
         });
     }
@@ -378,51 +349,6 @@ fn legend_swatch(name: &str) -> gtk::Box {
     row.append(&swatch);
     row.append(&label);
     row
-}
-
-fn build_fan_rows(state: &FanState) -> gtk::Box {
-    let outer = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
-        .build();
-
-    let header = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
-        .build();
-    let name = gtk::Label::builder()
-        .label(format!("{} fan", state.name))
-        .halign(gtk::Align::Start)
-        .hexpand(true)
-        .build();
-    name.add_css_class("fan-heading");
-    header.append(&name);
-    header.append(&state.enable);
-    outer.append(&header);
-
-    let grid = gtk::Grid::builder().column_spacing(2).row_spacing(2).build();
-
-    let t_label = gtk::Label::builder()
-        .label("T")
-        .halign(gtk::Align::End)
-        .build();
-    t_label.add_css_class("endpoint-caption");
-    grid.attach(&t_label, 0, 0, 1, 1);
-
-    let d_label = gtk::Label::builder()
-        .label("%")
-        .halign(gtk::Align::End)
-        .build();
-    d_label.add_css_class("endpoint-caption");
-    grid.attach(&d_label, 0, 1, 1, 1);
-
-    for i in 0..8 {
-        grid.attach(&state.temp_spins[i], (i + 1) as i32, 0, 1, 1);
-        grid.attach(&state.duty_spins[i], (i + 1) as i32, 1, 1, 1);
-    }
-
-    outer.append(&grid);
-    outer
 }
 
 fn screen_to_data(x: f64, y: f64, w: f64, h: f64) -> (f64, f64) {
@@ -500,11 +426,13 @@ fn draw_chart(cr: &gtk::cairo::Context, w: f64, h: f64, states: &[FanState]) {
         cr.move_to(2.0, y + 3.0);
         let _ = cr.show_text(&format!("{pct}%"));
     }
-    for temp in [30u32, 50, 70, 90] {
+    for temp in (30u32..=100).step_by(5) {
         let x = plot_l
             + plot_w * ((temp as f64 - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)).clamp(0.0, 1.0);
-        cr.move_to(x - 8.0, h - 2.0);
-        let _ = cr.show_text(&format!("{temp}°"));
+        let label = format!("{temp}");
+        let ext = cr.text_extents(&label).map(|e| e.width()).unwrap_or(8.0);
+        cr.move_to(x - ext / 2.0, h - 2.0);
+        let _ = cr.show_text(&label);
     }
 
     for state in states {
@@ -524,11 +452,17 @@ fn draw_chart(cr: &gtk::cairo::Context, w: f64, h: f64, states: &[FanState]) {
         }
         let _ = cr.stroke();
 
-        cr.set_source_rgba(r, g, b, 1.0);
+        // Nodes with their duty% drawn above, G-Helper style.
         for (&temp, &dt) in t.iter().zip(d.iter()) {
             let (x, y) = data_to_screen(temp as f64, dt as f64, w, h);
+            cr.set_source_rgba(r, g, b, 1.0);
             cr.arc(x, y, POINT_RADIUS, 0.0, std::f64::consts::TAU);
             let _ = cr.fill();
+
+            let label = format!("{dt}");
+            let ext = cr.text_extents(&label).map(|e| e.width()).unwrap_or(8.0);
+            cr.move_to(x - ext / 2.0, (y - 7.0).max(plot_t + 8.0));
+            let _ = cr.show_text(&label);
         }
     }
 }
